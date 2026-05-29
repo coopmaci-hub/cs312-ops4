@@ -1,0 +1,173 @@
+---
+- name: Setup Minecraft Server
+  hosts: minecraft
+  become: true
+
+  vars:
+    aws_region: us-east-1
+    ecr_repo: 905418052271.dkr.ecr.us-east-1.amazonaws.com/cs312-minecraft
+    image_tag: v1
+    s3_bucket: cs312-minecraft-backups
+    s3_key: world-backup.tar.gz
+    data_dir: /data
+
+  tasks:
+
+    - name: Install k3s
+      shell: |
+        curl -sfL https://get.k3s.io | sh -
+
+    - name: Install awscli
+      apt:
+        name: awscli
+        update_cache: yes
+        state: present
+
+    - name: Make k3s dir
+      shell: |
+        mkdir /home/ubuntu/k3s
+
+    - name: Write Minecraft Service
+      shell: |
+        cat <<EOF > /home/ubuntu/k3s/minecraft-service.yaml
+        apiVersion: v1
+        kind: Service
+
+        metadata:
+          name: minecraft
+
+        spec:
+          type: LoadBalancer
+
+          selector:
+            app: minecraft
+
+          ports:
+            - port: 25565
+              targetPort: 25565
+              protocol: TCP
+        EOF
+
+
+    - name: Write ConfigMap
+      shell: |
+        cat <<EOF > /home/ubuntu/k3s/minecraft-configmap.yaml
+        apiVersion: v1
+        kind: ConfigMap
+
+        metadata:
+          name: minecraft-config
+
+        data:
+          EULA: "TRUE"
+          MOTD: "MACIE COOPER"
+          TYPE: "PAPER"
+        EOF
+
+    - name: Write StatefulSet
+      shell: |
+        cat <<EOF > /home/ubuntu/k3s/minecraft-statefulset.yaml
+        apiVersion: apps/v1
+        kind: StatefulSet
+
+        metadata:
+          name: minecraft
+          labels:
+            app: minecraft
+
+        spec:
+          serviceName: minecraft
+          replicas: 1
+          selector:
+            matchLabels:
+              app: minecraft
+
+          template:
+            metadata:
+              labels:
+                app: minecraft
+
+            spec:
+              containers:
+                - name: minecraft
+                  image: itzg/minecraft-server:java25
+
+                  ports:
+                    - containerPort: 25565
+
+                  envFrom:
+                    - configMapRef:
+                        name: minecraft-config
+
+                  volumeMounts:
+                    - name: minecraft-data
+                      mountPath: /data
+
+                  startupProbe:
+                    tcpSocket:
+                      port: 25565
+                    failureThreshold: 30
+                    periodSeconds: 10
+
+                  readinessProbe:
+                    tcpSocket:
+                      port: 25565
+                    initialDelaySeconds: 20
+                    periodSeconds: 10
+
+                  livenessProbe:
+                    tcpSocket:
+                      port: 25565
+                    initialDelaySeconds: 120
+                    periodSeconds: 30
+
+                  resources:
+                    requests:
+                      memory: "1Gi"
+                      cpu: "500m"
+
+                    limits:
+                      memory: "1.5Gi"
+                      cpu: "2"
+
+              volumes:
+                - name: minecraft-data
+                  hostPath:
+                    path: /data
+                    type: Directory
+
+        EOF
+    
+
+    - name: Create data directory
+      file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: "0755"  
+
+    - name: Check if backup exists in S3
+      shell: |
+        aws s3 ls s3://{{ s3_bucket }}/{{ s3_key }}
+      register: s3_check
+      failed_when: false
+      environment:
+        AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+    - name: Download world backup from S3
+      shell: |
+        aws s3 cp s3://{{ s3_bucket }}/{{ s3_key }} /tmp/world.tar.gz
+      when: s3_check.rc == 0
+      environment:
+        AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+    - name: Extract world into data directory
+      shell: |
+        tar -xzf /tmp/world.tar.gz -C {{ data_dir }}
+      when: s3_check.rc == 0     
+
+    - name: Apply manifests
+      shell: |
+        kubectl apply -f /home/ubuntu/k3s/minecraft-configmap.yaml -f /home/ubuntu/k3s/minecraft-statefulset.yaml -f /home/ubuntu/k3s/minecraft-service.yaml
+    
+
+
